@@ -292,6 +292,48 @@ async function doClearFolders(protectFiles: Set<string>, clearFolders: Set<strin
   }
 }
 
+const artifacts: Array<Artifact> = [];
+const clearFolders = new Set<string>();
+const protectFiles = new Set<string>();
+const tasks = new Array<Promise<void>>();
+
+async function createAutoRestApi(currentDirUri: string, ...additionalConfigurations: any[]): Promise<AutoRest> {
+  // get an instance of AutoRest and add the command line switches to the configuration.
+  const api = new AutoRest(new EnhancedFileSystem((<any>MergeConfigurations(...args.switches))['github-auth-token'] || process.env.GITHUB_AUTH_TOKEN), ResolveUri(currentDirUri, args.configFileOrFolder || '.'))
+  api.AddConfiguration(args.switches);
+
+  if (additionalConfigurations) {
+    additionalConfigurations.forEach(config => api.AddConfiguration(config));
+  }
+
+  // listen for output messages and file writes
+  subscribeMessages(api, () => exitcode++);
+
+  const config = (await api.view);
+
+  // TODO: Remove before merging!
+  console.log(`*** output-folder: ${config.GetEntry(<any>"output-folder")}\n`);
+  console.log(`*** python.output-folder: ${config.GetEntry(<any>"python.output-folder")}\n`);
+
+  api.GeneratedFile.Subscribe((_, artifact) => {
+    if (config.HelpRequested) {
+      artifacts.push(artifact);
+      return;
+    }
+
+    protectFiles.add(artifact.uri);
+    tasks.push((artifact.type === 'binary-file' ? WriteBinary(artifact.uri, artifact.content) : WriteString(artifact.uri, artifact.content)));
+  });
+  api.Message.Subscribe((_, message) => {
+    if (message.Channel === Channel.Protect && message.Details) {
+      protectFiles.add(message.Details);
+    }
+  });
+  api.ClearFolder.Subscribe((_, folder) => clearFolders.add(folder));
+
+  return api;
+}
+
 async function currentMain(autorestArgs: Array<string>): Promise<number> {
   if (autorestArgs[0] === 'init') {
     await autorestInit();
@@ -321,48 +363,15 @@ async function currentMain(autorestArgs: Array<string>): Promise<number> {
   const currentDirUri = CreateFolderUri(currentDirectory());
 
   if (args.rawSwitches['help']) {
-    // if they are asking for help, feed a false file to config so we don't load a user's configuration 
+    // if they are asking for help, feed a false file to config so we don't load a user's configuration
     args.configFileOrFolder = 'invalid.filename.md';
   }
 
-  // get an instance of AutoRest and add the command line switches to the configuration.
-  const api = new AutoRest(new EnhancedFileSystem((<any>MergeConfigurations(...args.switches))['github-auth-token'] || process.env.GITHUB_AUTH_TOKEN), ResolveUri(currentDirUri, args.configFileOrFolder || '.'));
-  api.AddConfiguration(args.switches);
-
-  // listen for output messages and file writes
-  subscribeMessages(api, () => exitcode++);
-  const artifacts: Array<Artifact> = [];
-  const clearFolders = new Set<string>();
-  const protectFiles = new Set<string>();
-  let fastMode = false;
-  const tasks = new Array<Promise<void>>();
-
+  const api = await createAutoRestApi(currentDirUri);
   const config = (await api.view);
 
-  api.GeneratedFile.Subscribe((_, artifact) => {
-    if (config.HelpRequested) {
-      artifacts.push(artifact);
-      return;
-    }
-
-    protectFiles.add(artifact.uri);
-    tasks.push((artifact.type === 'binary-file' ? WriteBinary(artifact.uri, artifact.content) : WriteString(artifact.uri, artifact.content)));
-  });
-  api.Message.Subscribe((_, message) => {
-    if (message.Channel === Channel.Protect && message.Details) {
-      protectFiles.add(message.Details);
-    }
-  });
-  api.ClearFolder.Subscribe((_, folder) => clearFolders.add(folder));
-
-  // maybe a resource schema batch process
-  if (config['resource-schema-batch']) {
-    return resourceSchemaBatch(api);
-  }
-  fastMode = !!config['fast-mode'];
-
   if (config['batch']) {
-    await batch(api);
+    await batch(api, currentDirUri);
   } else {
     const result = await api.Process().finish;
     if (result !== true) {
@@ -451,90 +460,23 @@ function getRds(schema: any, path: string): Array<string> {
   return result;
 }
 
-async function resourceSchemaBatch(api: AutoRest): Promise<number> {
-  // get the configuration
-  const outputs = new Map<string, string>();
-  const schemas = new Array<string>();
-
-  let outstanding: Promise<void> = Promise.resolve();
-
-  // ask for the view without
-  const config = await api.RegenerateView();
-  for (const batchConfig of config.GetNestedConfiguration('resource-schema-batch')) { // really, there should be only one
-    for (const eachFile of batchConfig['input-file']) {
-      const path = ResolveUri(config.configFileFolderUri, eachFile);
-      const content = await ReadUri(path);
-      if (!await IsOpenApiDocument(content)) {
-        exitcode++;
-        console.error(color(`!File ${path} is not a OpenAPI file.`));
-        continue;
-      }
-
-      // Create the autorest instance for that item
-      const instance = new AutoRest(new RealFileSystem(), config.configFileFolderUri);
-      instance.GeneratedFile.Subscribe((_, file) => {
-        if (file.uri.endsWith('.json')) {
-          const more = JSON.parse(file.content);
-          if (!outputs.has(file.uri)) {
-            outputs.set(file.uri, file.content);
-            outstanding = outstanding.then(() => file.type === 'binary-file' ? WriteBinary(file.uri, file.content) : WriteString(file.uri, file.content));
-            schemas.push(...getRds(more, file.uri));
-            return;
-          } else {
-            const existing = JSON.parse(<string>outputs.get(file.uri));
-
-            schemas.push(...getRds(more, file.uri));
-            existing.resourceDefinitions = shallowMerge(existing.resourceDefinitions, more.resourceDefinitions);
-            existing.definitions = shallowMerge(existing.definitions, more.definitions);
-            const content = JSON.stringify(existing, null, 2);
-            outputs.set(file.uri, content);
-            outstanding = outstanding.then(() => file.type === 'binary-file' ? WriteBinary(file.uri, file.content) : WriteString(file.uri, content));
-          }
-        }
-      });
-      subscribeMessages(instance, () => exitcode++);
-
-      // set configuration for that item
-      instance.AddConfiguration(ShallowCopy(batchConfig, 'input-file'));
-      instance.AddConfiguration({ 'input-file': eachFile });
-
-      console.log(`Running autorest for *${path}* `);
-
-      // ok, kick off the process for that one.
-      await instance.Process().finish.then(async (result) => {
-        if (result !== true) {
-          exitcode++;
-          throw result;
-        }
-      });
-    }
-  }
-
-  await outstanding;
-
-  return exitcode;
-}
-
-async function batch(api: AutoRest): Promise<void> {
+async function batch(api: AutoRest, currentDirUri: string): Promise<void> {
   const config = await api.view;
-  const batchTaskConfigReference: any = {};
-  api.AddConfiguration(batchTaskConfigReference);
+  const isjson = (args.rawSwitches['message-format'] === 'json' || args.rawSwitches['message-format'] === 'yaml');
+
   for (const batchTaskConfig of config.GetEntry(<any>'batch')) {
-    const isjson = (args.rawSwitches['message-format'] === 'json' || args.rawSwitches['message-format'] === 'yaml');
+    const batchApi = await createAutoRestApi(currentDirUri, batchTaskConfig);
+
     if (!isjson) {
-      outputMessage(api, {
+      outputMessage(batchApi, {
         Channel: Channel.Information,
         Text: `Processing batch task - ${JSON.stringify(batchTaskConfig)} .`
       }, () => { });
     }
-    // update batch task config section
-    for (const key of Object.keys(batchTaskConfigReference)) { delete batchTaskConfigReference[key]; }
-    Object.assign(batchTaskConfigReference, batchTaskConfig);
-    api.Invalidate();
 
-    const result = await api.Process().finish;
+    const result = await batchApi.Process().finish;
     if (result !== true) {
-      outputMessage(api, {
+      outputMessage(batchApi, {
         Channel: Channel.Error,
         Text: `Failure during batch task - ${JSON.stringify(batchTaskConfig)} -- ${result}.`
       }, () => { });
